@@ -72,6 +72,30 @@ where
     flow_recorder: FlowRecorder,
 }
 
+/// Whether a broker login may complete an existing auth session.
+///
+/// The session must belong to the client asking and still be live, and the
+/// broker must return to the redirect URI that session was opened for: the code
+/// is redeemed against that session's `redirect_uri`, so a mismatch would hand
+/// the application a code it can never exchange.
+fn linked_session_allowed(
+    session: &AuthSession,
+    client_id: Uuid,
+    redirect_uri: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), CoreError> {
+    if session.client_id != client_id || session.redirect_uri != redirect_uri {
+        warn!("broker login names an auth session opened for another client or redirect_uri");
+        return Err(CoreError::InvalidRequest);
+    }
+
+    if now >= session.expires_at {
+        return Err(CoreError::SessionNotFound);
+    }
+
+    Ok(())
+}
+
 fn evaluate_redirect_uri(allowed: &[String], redirect_uri: &str) -> Result<(), CoreError> {
     if allowed.is_empty() {
         return Err(CoreError::RedirectUriNotFound);
@@ -574,9 +598,34 @@ where
             })
             .transpose()?;
 
+        // A login page reached from `/authorize` links the broker flow to that auth
+        // session, and the callback completes it rather than opening a new one. Its
+        // PKCE binding, not the query's, is what the code will be redeemed against.
+        let linked_session = match input.auth_session_id {
+            Some(session_code) => {
+                let session = self
+                    .auth_session_repository
+                    .get_by_session_code(session_code)
+                    .await?
+                    .in_realm(&scope)
+                    .map_err(|_| CoreError::SessionNotFound)?
+                    .into_inner();
+                linked_session_allowed(&session, client.id, &input.redirect_uri, Utc::now())?;
+                Some(session)
+            }
+            None => None,
+        };
+
+        let (bound_challenge, bound_method) = match &linked_session {
+            Some(session) => (
+                session.code_challenge.as_deref(),
+                session.code_challenge_method.clone(),
+            ),
+            None => (input.code_challenge.as_deref(), challenge_method),
+        };
+
         if client.require_pkce
-            && !(input.code_challenge.is_some()
-                && challenge_method == Some(CodeChallengeMethod::S256))
+            && !(bound_challenge.is_some() && bound_method == Some(CodeChallengeMethod::S256))
         {
             return Err(CoreError::PkceRequired);
         }
@@ -1332,6 +1381,63 @@ mod tests {
             .times(1)
             .returning(|_| Box::pin(async { Ok(LoginAdmission::Proceed) }));
         admission
+    }
+
+    #[test]
+    fn a_live_session_of_the_same_client_and_redirect_uri_can_be_linked() {
+        let (_, session) = scope_and_session();
+
+        let result = linked_session_allowed(
+            &session,
+            session.client_id,
+            "https://app.example/callback",
+            Utc::now(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_session_of_another_client_cannot_be_linked() {
+        let (_, session) = scope_and_session();
+
+        let result = linked_session_allowed(
+            &session,
+            Uuid::new_v4(),
+            "https://app.example/callback",
+            Utc::now(),
+        );
+
+        assert!(matches!(result, Err(CoreError::InvalidRequest)));
+    }
+
+    #[test]
+    fn a_session_opened_for_another_redirect_uri_cannot_be_linked() {
+        let (_, session) = scope_and_session();
+
+        let result = linked_session_allowed(
+            &session,
+            session.client_id,
+            "https://app.example/elsewhere",
+            Utc::now(),
+        );
+
+        assert!(matches!(result, Err(CoreError::InvalidRequest)));
+    }
+
+    #[test]
+    fn an_expired_session_cannot_be_linked() {
+        let (_, session) = scope_and_session();
+        let after_expiry = session.expires_at + Duration::seconds(1);
+
+        let result = linked_session_allowed(
+            &session,
+            session.client_id,
+            "https://app.example/callback",
+            after_expiry,
+        );
+
+        assert!(matches!(result, Err(CoreError::SessionNotFound)));
     }
 
     #[tokio::test]
